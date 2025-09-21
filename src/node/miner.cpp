@@ -77,9 +77,8 @@ void RegenerateCommitments(CBlock& block, ChainstateManager& chainman)
 
 static BlockAssembler::Options ClampOptions(BlockAssembler::Options options)
 {
-    Assert(options.block_reserved_weight <= MAX_BLOCK_WEIGHT);
-    Assert(options.block_reserved_weight >= MINIMUM_BLOCK_RESERVED_WEIGHT);
-    Assert(options.coinbase_output_max_additional_sigops <= MAX_BLOCK_SIGOPS_COST);
+    options.block_reserved_weight = std::clamp<size_t>(options.block_reserved_weight, MINIMUM_BLOCK_RESERVED_WEIGHT, MAX_BLOCK_WEIGHT);
+    options.coinbase_output_max_additional_sigops = std::clamp<size_t>(options.coinbase_output_max_additional_sigops, 0, MAX_BLOCK_SIGOPS_COST);
     // Limit weight to between block_reserved_weight and MAX_BLOCK_WEIGHT for sanity:
     // block_reserved_weight can safely exceed -blockmaxweight, but the rest of the block template will be empty.
     options.nBlockMaxWeight = std::clamp<size_t>(options.nBlockMaxWeight, options.block_reserved_weight, MAX_BLOCK_WEIGHT);
@@ -179,10 +178,10 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     pblock->nBits          = GetNextWorkRequired(pindexPrev, pblock, chainparams.GetConsensus());
     pblock->nNonce         = 0;
 
-    BlockValidationState state;
-    if (m_options.test_block_validity && !TestBlockValidity(state, chainparams, m_chainstate, *pblock, pindexPrev,
-                                                            /*fCheckPOW=*/false, /*fCheckMerkleRoot=*/false)) {
-        throw std::runtime_error(strprintf("%s: TestBlockValidity failed: %s", __func__, state.ToString()));
+    if (m_options.test_block_validity) {
+        if (BlockValidationState state{TestBlockValidity(m_chainstate, *pblock, /*check_pow=*/false, /*check_merkle_root=*/false)}; !state.IsValid()) {
+            throw std::runtime_error(strprintf("TestBlockValidity failed: %s", state.ToString()));
+        }
     }
     const auto time_2{SteadyClock::now()};
 

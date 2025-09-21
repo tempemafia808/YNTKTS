@@ -27,7 +27,7 @@ get_directory_property(precious_variables CACHE_VARIABLES)
 # Project / Package metadata
 #=============================
 set(CLIENT_NAME "Bitcoin Core")
-set(CLIENT_VERSION_MAJOR 29)
+set(CLIENT_VERSION_MAJOR 30)
 set(CLIENT_VERSION_MINOR 99)
 set(CLIENT_VERSION_BUILD 0)
 set(CLIENT_VERSION_RC 0)
@@ -94,6 +94,7 @@ endif()
 #=============================
 include(CMakeDependentOption)
 # When adding a new option, end the <help_text> with a full stop for consistency.
+option(BUILD_BITCOIN_BIN "Build bitcoin executable." ON)
 option(BUILD_DAEMON "Build bitcoind executable." ON)
 option(BUILD_GUI "Build bitcoin-qt executable." OFF)
 option(BUILD_CLI "Build bitcoin-cli executable." ON)
@@ -140,7 +141,7 @@ endif()
 
 cmake_dependent_option(WITH_DBUS "Enable DBus support." ON "NOT CMAKE_SYSTEM_NAME MATCHES \"(Windows|Darwin)\" AND BUILD_GUI" OFF)
 
-option(ENABLE_IPC "Build multiprocess bitcoin-node and bitcoin-gui executables in addition to monolithic bitcoind and bitcoin-qt executables. Requires libmultiprocess library. Experimental." OFF)
+cmake_dependent_option(ENABLE_IPC "Build multiprocess bitcoin-node and bitcoin-gui executables in addition to monolithic bitcoind and bitcoin-qt executables." ON "NOT WIN32" OFF)
 cmake_dependent_option(WITH_EXTERNAL_LIBMULTIPROCESS "Build with external libmultiprocess library instead of with local git subtree when ENABLE_IPC is enabled. This is not normally recommended, but can be useful for developing libmultiprocess itself." OFF "ENABLE_IPC" OFF)
 if(ENABLE_IPC AND WITH_EXTERNAL_LIBMULTIPROCESS)
   find_package(Libmultiprocess REQUIRED COMPONENTS Lib)
@@ -202,6 +203,7 @@ target_link_libraries(core_interface INTERFACE
 
 if(BUILD_FOR_FUZZING)
   message(WARNING "BUILD_FOR_FUZZING=ON will disable all other targets and force BUILD_FUZZ_BINARY=ON.")
+  set(BUILD_BITCOIN_BIN OFF)
   set(BUILD_DAEMON OFF)
   set(BUILD_CLI OFF)
   set(BUILD_TX OFF)
@@ -215,6 +217,7 @@ if(BUILD_FOR_FUZZING)
   set(BUILD_TESTS OFF)
   set(BUILD_GUI_TESTS OFF)
   set(BUILD_BENCH OFF)
+  set(ENABLE_IPC OFF)
   set(BUILD_FUZZ_BINARY ON)
 
   target_compile_definitions(core_interface INTERFACE
@@ -441,6 +444,7 @@ else()
   try_append_cxx_flags("-Wvla" TARGET warn_interface SKIP_LINK)
   try_append_cxx_flags("-Wshadow-field" TARGET warn_interface SKIP_LINK)
   try_append_cxx_flags("-Wthread-safety" TARGET warn_interface SKIP_LINK)
+  try_append_cxx_flags("-Wthread-safety-pointer" TARGET warn_interface SKIP_LINK)
   try_append_cxx_flags("-Wloop-analysis" TARGET warn_interface SKIP_LINK)
   try_append_cxx_flags("-Wredundant-decls" TARGET warn_interface SKIP_LINK)
   try_append_cxx_flags("-Wunused-member-function" TARGET warn_interface SKIP_LINK)
@@ -587,11 +591,9 @@ set(Python3_FIND_FRAMEWORK LAST CACHE STRING "")
 set(Python3_FIND_UNVERSIONED_NAMES FIRST CACHE STRING "")
 mark_as_advanced(Python3_FIND_FRAMEWORK Python3_FIND_UNVERSIONED_NAMES)
 find_package(Python3 3.10 COMPONENTS Interpreter)
-if(Python3_EXECUTABLE)
-  set(PYTHON_COMMAND ${Python3_EXECUTABLE})
-else()
+if(NOT TARGET Python3::Interpreter)
   list(APPEND configure_warnings
-    "Minimum required Python not found. Utils and rpcauth tests are disabled."
+    "Minimum required Python not found."
   )
 endif()
 
@@ -635,8 +637,6 @@ add_subdirectory(doc)
 
 add_subdirectory(src)
 
-include(cmake/tests.cmake)
-
 include(Maintenance)
 setup_split_debug_script()
 add_maintenance_targets()
@@ -647,6 +647,7 @@ message("\n")
 message("Configure summary")
 message("=================")
 message("Executables:")
+message("  bitcoin ............................. ${BUILD_BITCOIN_BIN}")
 message("  bitcoind ............................ ${BUILD_DAEMON}")
 if(BUILD_DAEMON AND ENABLE_IPC)
   set(bitcoin_daemon_status ON)

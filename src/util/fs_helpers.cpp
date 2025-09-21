@@ -22,17 +22,6 @@
 #include <utility>
 
 #ifndef WIN32
-// for posix_fallocate, in cmake/introspection.cmake we check if it is present after this
-#ifdef __linux__
-
-#ifdef _POSIX_C_SOURCE
-#undef _POSIX_C_SOURCE
-#endif
-
-#define _POSIX_C_SOURCE 200112L
-
-#endif // __linux__
-
 #include <fcntl.h>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -40,6 +29,11 @@
 #include <io.h>
 #include <shlobj.h>
 #endif // WIN32
+
+#ifdef __APPLE__
+#include <sys/mount.h>
+#include <sys/param.h>
+#endif
 
 /** Mutex to protect dir_locks. */
 static GlobalMutex cs_dir_locks;
@@ -309,3 +303,15 @@ std::optional<fs::perms> InterpretPermString(const std::string& s)
         return std::nullopt;
     }
 }
+
+#ifdef __APPLE__
+FSType GetFilesystemType(const fs::path& path)
+{
+    if (struct statfs fs_info; statfs(path.c_str(), &fs_info)) {
+        return FSType::ERROR;
+    } else if (std::string_view{fs_info.f_fstypename} == "exfat") {
+        return FSType::EXFAT;
+    }
+    return FSType::OTHER;
+}
+#endif

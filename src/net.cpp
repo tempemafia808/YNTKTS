@@ -266,6 +266,12 @@ std::optional<CService> GetLocalAddrForPeer(CNode& node)
     return std::nullopt;
 }
 
+void ClearLocal()
+{
+    LOCK(g_maplocalhost_mutex);
+    return mapLocalHost.clear();
+}
+
 // learn a new local address
 bool AddLocal(const CService& addr_, int nScore)
 {
@@ -568,9 +574,9 @@ void CNode::CloseSocketDisconnect()
     m_i2p_sam_session.reset();
 }
 
-void CConnman::AddWhitelistPermissionFlags(NetPermissionFlags& flags, const CNetAddr &addr, const std::vector<NetWhitelistPermissions>& ranges) const {
+void CConnman::AddWhitelistPermissionFlags(NetPermissionFlags& flags, std::optional<CNetAddr> addr, const std::vector<NetWhitelistPermissions>& ranges) const {
     for (const auto& subnet : ranges) {
-        if (subnet.m_subnet.Match(addr)) {
+        if (addr.has_value() && subnet.m_subnet.Match(addr.value())) {
             NetPermissions::AddFlag(flags, subnet.m_flags);
         }
     }
@@ -1632,7 +1638,7 @@ std::pair<size_t, bool> CConnman::SocketSendData(CNode& node) const
                 flags |= MSG_MORE;
             }
 #endif
-            nBytes = node.m_sock->Send(reinterpret_cast<const char*>(data.data()), data.size(), flags);
+            nBytes = node.m_sock->Send(data.data(), data.size(), flags);
         }
         if (nBytes > 0) {
             node.m_last_send = GetTime<std::chrono::seconds>();
@@ -1762,7 +1768,11 @@ void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
 {
     int nInbound = 0;
 
-    AddWhitelistPermissionFlags(permission_flags, addr, vWhitelistedRangeIncoming);
+    const bool inbound_onion = std::find(m_onion_binds.begin(), m_onion_binds.end(), addr_bind) != m_onion_binds.end();
+
+    // Tor inbound connections do not reveal the peer's actual network address.
+    // Therefore do not apply address-based whitelist permissions to them.
+    AddWhitelistPermissionFlags(permission_flags, inbound_onion ? std::optional<CNetAddr>{} : addr, vWhitelistedRangeIncoming);
 
     {
         LOCK(m_nodes_mutex);
@@ -1817,7 +1827,6 @@ void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
     NodeId id = GetNewNodeId();
     uint64_t nonce = GetDeterministicRandomizer(RANDOMIZER_ID_LOCALHOSTNONCE).Write(id).Finalize();
 
-    const bool inbound_onion = std::find(m_onion_binds.begin(), m_onion_binds.end(), addr_bind) != m_onion_binds.end();
     // The V2Transport transparently falls back to V1 behavior when an incoming V1 connection is
     // detected, so use it whenever we signal NODE_P2P_V2.
     ServiceFlags local_services = GetLocalServices();
@@ -3130,7 +3139,7 @@ bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError,
 
     // Allow binding if the port is still in TIME_WAIT state after
     // the program was closed and restarted.
-    if (sock->SetSockOpt(SOL_SOCKET, SO_REUSEADDR, (sockopt_arg_type)&nOne, sizeof(int)) == SOCKET_ERROR) {
+    if (sock->SetSockOpt(SOL_SOCKET, SO_REUSEADDR, &nOne, sizeof(int)) == SOCKET_ERROR) {
         strError = Untranslated(strprintf("Error setting SO_REUSEADDR on socket: %s, continuing anyway", NetworkErrorString(WSAGetLastError())));
         LogPrintf("%s\n", strError.original);
     }
@@ -3139,14 +3148,14 @@ bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError,
     // and enable it by default or not. Try to enable it, if possible.
     if (addrBind.IsIPv6()) {
 #ifdef IPV6_V6ONLY
-        if (sock->SetSockOpt(IPPROTO_IPV6, IPV6_V6ONLY, (sockopt_arg_type)&nOne, sizeof(int)) == SOCKET_ERROR) {
+        if (sock->SetSockOpt(IPPROTO_IPV6, IPV6_V6ONLY, &nOne, sizeof(int)) == SOCKET_ERROR) {
             strError = Untranslated(strprintf("Error setting IPV6_V6ONLY on socket: %s, continuing anyway", NetworkErrorString(WSAGetLastError())));
             LogPrintf("%s\n", strError.original);
         }
 #endif
 #ifdef WIN32
         int nProtLevel = PROTECTION_LEVEL_UNRESTRICTED;
-        if (sock->SetSockOpt(IPPROTO_IPV6, IPV6_PROTECTION_LEVEL, (const char*)&nProtLevel, sizeof(int)) == SOCKET_ERROR) {
+        if (sock->SetSockOpt(IPPROTO_IPV6, IPV6_PROTECTION_LEVEL, &nProtLevel, sizeof(int)) == SOCKET_ERROR) {
             strError = Untranslated(strprintf("Error setting IPV6_PROTECTION_LEVEL on socket: %s, continuing anyway", NetworkErrorString(WSAGetLastError())));
             LogPrintf("%s\n", strError.original);
         }
@@ -3496,7 +3505,7 @@ CConnman::~CConnman()
     Stop();
 }
 
-std::vector<CAddress> CConnman::GetAddresses(size_t max_addresses, size_t max_pct, std::optional<Network> network, const bool filtered) const
+std::vector<CAddress> CConnman::GetAddressesUnsafe(size_t max_addresses, size_t max_pct, std::optional<Network> network, const bool filtered) const
 {
     std::vector<CAddress> addresses = addrman.GetAddr(max_addresses, max_pct, network, filtered);
     if (m_banman) {
@@ -3521,7 +3530,7 @@ std::vector<CAddress> CConnman::GetAddresses(CNode& requestor, size_t max_addres
     auto r = m_addr_response_caches.emplace(cache_id, CachedAddrResponse{});
     CachedAddrResponse& cache_entry = r.first->second;
     if (cache_entry.m_cache_entry_expiration < current_time) { // If emplace() added new one it has expiration 0.
-        cache_entry.m_addrs_response_cache = GetAddresses(max_addresses, max_pct, /*network=*/std::nullopt);
+        cache_entry.m_addrs_response_cache = GetAddressesUnsafe(max_addresses, max_pct, /*network=*/std::nullopt);
         // Choosing a proper cache lifetime is a trade-off between the privacy leak minimization
         // and the usefulness of ADDR responses to honest users.
         //
@@ -3964,8 +3973,8 @@ void CConnman::PerformReconnections()
 
 void CConnman::ASMapHealthCheck()
 {
-    const std::vector<CAddress> v4_addrs{GetAddresses(/*max_addresses=*/ 0, /*max_pct=*/ 0, Network::NET_IPV4, /*filtered=*/ false)};
-    const std::vector<CAddress> v6_addrs{GetAddresses(/*max_addresses=*/ 0, /*max_pct=*/ 0, Network::NET_IPV6, /*filtered=*/ false)};
+    const std::vector<CAddress> v4_addrs{GetAddressesUnsafe(/*max_addresses=*/0, /*max_pct=*/0, Network::NET_IPV4, /*filtered=*/false)};
+    const std::vector<CAddress> v6_addrs{GetAddressesUnsafe(/*max_addresses=*/0, /*max_pct=*/0, Network::NET_IPV6, /*filtered=*/false)};
     std::vector<CNetAddr> clearnet_addrs;
     clearnet_addrs.reserve(v4_addrs.size() + v6_addrs.size());
     std::transform(v4_addrs.begin(), v4_addrs.end(), std::back_inserter(clearnet_addrs),
@@ -4005,6 +4014,11 @@ static void CaptureMessageToFile(const CAddress& addr,
     uint32_t size = data.size();
     ser_writedata32(f, size);
     f << data;
+
+    if (f.fclose() != 0) {
+        throw std::ios_base::failure(
+            strprintf("Error closing %s after write, file contents are likely incomplete", fs::PathToString(path)));
+    }
 }
 
 std::function<void(const CAddress& addr,

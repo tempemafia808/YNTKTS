@@ -115,7 +115,6 @@ protected:
     virtual void MempoolTransactionsRemovedForBlock(const std::vector<RemovedMempoolTransactionInfo>& txs_removed_for_block, unsigned int nBlockHeight) {}
     /**
      * Notifies listeners of a block being connected.
-     * Provides a vector of transactions evicted from the mempool as a result.
      *
      * Called on a background thread.
      */
@@ -151,7 +150,7 @@ protected:
      * is guaranteed to be the current best block at the time the
      * callback was generated (not necessarily now).
      */
-    virtual void BlockChecked(const CBlock&, const BlockValidationState&) {}
+    virtual void BlockChecked(const std::shared_ptr<const CBlock>&, const BlockValidationState&) {}
     /**
      * Notifies listeners that a block which builds directly on our current tip
      * has been received and connected to the headers tree, though not validated yet.
@@ -225,7 +224,7 @@ public:
     void BlockConnected(ChainstateRole, const std::shared_ptr<const CBlock> &, const CBlockIndex *pindex);
     void BlockDisconnected(const std::shared_ptr<const CBlock> &, const CBlockIndex* pindex);
     void ChainStateFlushed(ChainstateRole, const CBlockLocator &);
-    void BlockChecked(const CBlock&, const BlockValidationState&);
+    void BlockChecked(const std::shared_ptr<const CBlock>&, const BlockValidationState&);
     void NewPoWValidBlock(const CBlockIndex *, const std::shared_ptr<const CBlock>&);
 };
 

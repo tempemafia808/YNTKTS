@@ -31,7 +31,11 @@ To build dependencies for the current arch+OS:
 
 ### FreeBSD
 
-    pkg install bash
+    pkg install bash cmake curl gmake
+
+Skip the following packages if you don't intend to use the GUI and will build with [`NO_QT=1`](#dependency-options):
+
+    pkg install bison ninja pkgconf python3
 
 To build dependencies for the current arch+OS:
 
@@ -39,7 +43,7 @@ To build dependencies for the current arch+OS:
 
 ### NetBSD
 
-    pkgin install bash gmake
+    pkgin install bash cmake curl gmake perl
 
 To build dependencies for the current arch+OS:
 
@@ -47,11 +51,23 @@ To build dependencies for the current arch+OS:
 
 ### OpenBSD
 
-    pkg_add bash gmake gtar
+    pkg_add bash cmake curl gmake gtar
 
 To build dependencies for the current arch+OS:
 
     gmake
+
+### Alpine
+
+    apk add bash build-base cmake curl make patch
+
+Skip the following packages if you don't intend to use the GUI and will build with [`NO_QT=1`](#dependency-options):
+
+    apk add bison linux-headers samurai pkgconf python3
+
+To build dependencies for the current arch+OS:
+
+    make
 
 ## Configuring Bitcoin Core
 
@@ -80,7 +96,7 @@ The following can be set when running make: `make FOO=bar`
 - `NO_ZMQ`: Don't download/build/cache packages needed for enabling ZeroMQ
 - `NO_WALLET`: Don't download/build/cache libs needed to enable the wallet (SQLite)
 - `NO_USDT`: Don't download/build/cache packages needed for enabling USDT tracepoints
-- `MULTIPROCESS`: Build libmultiprocess (experimental)
+- `NO_IPC`: Don't build Cap’n Proto and libmultiprocess packages. Default on Windows.
 - `DEBUG`: Disable some optimizations and enable more runtime checking
 - `HOST_ID_SALT`: Optional salt to use when generating host package ids
 - `BUILD_ID_SALT`: Optional salt to use when generating build package ids

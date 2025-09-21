@@ -12,6 +12,7 @@
 #include <node/miner.h>
 #include <policy/policy.h>
 #include <test/util/random.h>
+#include <test/util/transaction_utils.h>
 #include <test/util/txmempool.h>
 #include <txmempool.h>
 #include <uint256.h>
@@ -22,6 +23,7 @@
 #include <util/translation.h>
 #include <validation.h>
 #include <versionbits.h>
+#include <pow.h>
 
 #include <test/util/setup_common.h>
 
@@ -215,6 +217,10 @@ void MinerTestingSetup::TestPackageSelection(const CScript& scriptPubKey, const 
     tx.vout.resize(2);
     tx.vout[0].nValue = 5000000000LL - 100000000;
     tx.vout[1].nValue = 100000000; // 1BTC output
+    // Increase size to avoid rounding errors: when the feerate is extremely small (i.e. 1sat/kvB), evaluating the fee
+    // at smaller sizes gives us rounded values that are equal to each other, which means we incorrectly include
+    // hashFreeTx2 + hashLowFeeTx2.
+    BulkTransaction(tx, 4000);
     Txid hashFreeTx2 = tx.GetHash();
     AddToMempool(tx_mempool, entry.Fee(0).SpendsCoinbase(true).FromTx(tx));
 
@@ -445,7 +451,7 @@ void MinerTestingSetup::TestBasicMining(const CScript& scriptPubKey, const std::
         tx.vout[0].nValue -= LOWFEE;
         hash = tx.GetHash();
         AddToMempool(tx_mempool, entry.Fee(LOWFEE).Time(Now<NodeSeconds>()).SpendsCoinbase(false).FromTx(tx));
-        BOOST_CHECK_EXCEPTION(mining->createNewBlock(options), std::runtime_error, HasReason("mandatory-script-verify-flag-failed"));
+        BOOST_CHECK_EXCEPTION(mining->createNewBlock(options), std::runtime_error, HasReason("block-script-verify-flag-failed"));
 
         // Delete the dummy blocks again.
         while (m_node.chainman->ActiveChain().Tip()->nHeight > nHeight) {
@@ -522,6 +528,10 @@ void MinerTestingSetup::TestBasicMining(const CScript& scriptPubKey, const std::
     BOOST_CHECK(TestSequenceLocks(CTransaction{tx}, tx_mempool)); // Sequence locks pass
     BOOST_CHECK(IsFinalTx(CTransaction(tx), m_node.chainman->ActiveChain().Tip()->nHeight + 2, m_node.chainman->ActiveChain().Tip()->GetMedianTimePast())); // Locktime passes on 2nd block
 
+    // ensure tx is final for a specific case where there is no locktime and block height is zero
+    tx.nLockTime = 0;
+    BOOST_CHECK(IsFinalTx(CTransaction(tx), /*nBlockHeight=*/0, m_node.chainman->ActiveChain().Tip()->GetMedianTimePast()));
+
     // absolute time locked
     tx.vin[0].prevout.hash = txFirst[3]->GetHash();
     tx.nLockTime = m_node.chainman->ActiveChain().Tip()->GetMedianTimePast();
@@ -591,7 +601,7 @@ void MinerTestingSetup::TestPrioritisedMining(const CScript& scriptPubKey, const
     tx.vin[0].scriptSig = CScript() << OP_1;
     tx.vout.resize(1);
     tx.vout[0].nValue = 5000000000LL; // 0 fee
-    uint256 hashFreePrioritisedTx = tx.GetHash();
+    Txid hashFreePrioritisedTx = tx.GetHash();
     AddToMempool(tx_mempool, entry.Fee(0).Time(Now<NodeSeconds>()).SpendsCoinbase(true).FromTx(tx));
     tx_mempool.PrioritiseTransaction(hashFreePrioritisedTx, 5 * COIN);
 
@@ -666,7 +676,44 @@ BOOST_AUTO_TEST_CASE(CreateNewBlock_validity)
     CScript scriptPubKey = CScript() << "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"_hex << OP_CHECKSIG;
     BlockAssembler::Options options;
     options.coinbase_output_script = scriptPubKey;
-    std::unique_ptr<BlockTemplate> block_template;
+
+    // Create and check a simple template
+    std::unique_ptr<BlockTemplate> block_template = mining->createNewBlock(options);
+    BOOST_REQUIRE(block_template);
+    {
+        CBlock block{block_template->getBlock()};
+        {
+            std::string reason;
+            std::string debug;
+            BOOST_REQUIRE(!mining->checkBlock(block, {.check_pow = false}, reason, debug));
+            BOOST_REQUIRE_EQUAL(reason, "bad-txnmrklroot");
+            BOOST_REQUIRE_EQUAL(debug, "hashMerkleRoot mismatch");
+        }
+
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+
+        {
+            std::string reason;
+            std::string debug;
+            BOOST_REQUIRE(mining->checkBlock(block, {.check_pow = false}, reason, debug));
+            BOOST_REQUIRE_EQUAL(reason, "");
+            BOOST_REQUIRE_EQUAL(debug, "");
+        }
+
+        {
+            // A block template does not have proof-of-work, but it might pass
+            // verification by coincidence. Grind the nonce if needed:
+            while (CheckProofOfWork(block.GetHash(), block.nBits, Assert(m_node.chainman)->GetParams().GetConsensus())) {
+                block.nNonce++;
+            }
+
+            std::string reason;
+            std::string debug;
+            BOOST_REQUIRE(!mining->checkBlock(block, {.check_pow = true}, reason, debug));
+            BOOST_REQUIRE_EQUAL(reason, "high-hash");
+            BOOST_REQUIRE_EQUAL(debug, "proof of work failed");
+        }
+    }
 
     // We can't make transactions until we have inputs
     // Therefore, load 110 blocks :)

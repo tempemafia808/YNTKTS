@@ -19,6 +19,7 @@ from test_framework.messages import (
     CTxOut,
     SEQUENCE_FINAL,
     tx_from_hex,
+    TX_MAX_STANDARD_VERSION,
     WITNESS_SCALE_FACTOR,
 )
 from test_framework.script import (
@@ -71,6 +72,7 @@ from test_framework.script import (
     OP_PUSHDATA1,
     OP_RETURN,
     OP_SWAP,
+    OP_TUCK,
     OP_VERIFY,
     SIGHASH_DEFAULT,
     SIGHASH_ALL,
@@ -172,9 +174,9 @@ def get(ctx, name):
         ctx[name] = expr
     return expr.value
 
-def getter(name):
+def getter(name, **kwargs):
     """Return a callable that evaluates name in its passed context."""
-    return lambda ctx: get(ctx, name)
+    return lambda ctx: get({**ctx, **kwargs}, name)
 
 def override(expr, **kwargs):
     """Return a callable that evaluates expr in a modified context."""
@@ -218,6 +220,20 @@ def default_controlblock(ctx):
     """Default expression for "controlblock": combine leafversion, negflag, pubkey_internal, merklebranch."""
     return bytes([get(ctx, "leafversion") + get(ctx, "negflag")]) + get(ctx, "pubkey_internal") + get(ctx, "merklebranch")
 
+def default_scriptcode_suffix(ctx):
+    """Default expression for "scriptcode_suffix", the actually used portion of the scriptcode."""
+    scriptcode = get(ctx, "scriptcode")
+    codesepnum = get(ctx, "codesepnum")
+    if codesepnum == -1:
+        return scriptcode
+    codeseps = 0
+    for (opcode, data, sop_idx) in scriptcode.raw_iter():
+        if opcode == OP_CODESEPARATOR:
+            if codeseps == codesepnum:
+                return CScript(scriptcode[sop_idx+1:])
+            codeseps += 1
+    assert False
+
 def default_sigmsg(ctx):
     """Default expression for "sigmsg": depending on mode, compute BIP341, BIP143, or legacy sigmsg."""
     tx = get(ctx, "tx")
@@ -237,12 +253,12 @@ def default_sigmsg(ctx):
             return TaprootSignatureMsg(tx, utxos, hashtype, idx, scriptpath=False, annex=annex)
     elif mode == "witv0":
         # BIP143 signature hash
-        scriptcode = get(ctx, "scriptcode")
+        scriptcode = get(ctx, "scriptcode_suffix")
         utxos = get(ctx, "utxos")
         return SegwitV0SignatureMsg(scriptcode, tx, idx, hashtype, utxos[idx].nValue)
     else:
         # Pre-segwit signature hash
-        scriptcode = get(ctx, "scriptcode")
+        scriptcode = get(ctx, "scriptcode_suffix")
         return LegacySignatureMsg(scriptcode, tx, idx, hashtype)[0]
 
 def default_sighash(ctx):
@@ -302,7 +318,12 @@ def default_hashtype_actual(ctx):
 
 def default_bytes_hashtype(ctx):
     """Default expression for "bytes_hashtype": bytes([hashtype_actual]) if not 0, b"" otherwise."""
-    return bytes([x for x in [get(ctx, "hashtype_actual")] if x != 0])
+    mode = get(ctx, "mode")
+    hashtype_actual = get(ctx, "hashtype_actual")
+    if mode != "taproot" or hashtype_actual != 0:
+        return bytes([hashtype_actual])
+    else:
+        return bytes()
 
 def default_sign(ctx):
     """Default expression for "sign": concatenation of signature and bytes_hashtype."""
@@ -380,6 +401,8 @@ DEFAULT_CONTEXT = {
     "key_tweaked": default_key_tweaked,
     # The tweak to use (None for script path spends, the actual tweak for key path spends).
     "tweak": default_tweak,
+    # The part of the scriptcode after the last executed OP_CODESEPARATOR.
+    "scriptcode_suffix": default_scriptcode_suffix,
     # The sigmsg value (preimage of sighash)
     "sigmsg": default_sigmsg,
     # The sighash value (32 bytes)
@@ -410,6 +433,8 @@ DEFAULT_CONTEXT = {
     "annex": None,
     # The codeseparator position (only when mode=="taproot").
     "codeseppos": -1,
+    # Which OP_CODESEPARATOR is the last executed one in the script (in legacy/P2SH/P2WSH).
+    "codesepnum": -1,
     # The redeemscript to add to the scriptSig (if P2SH; None implies not P2SH).
     "script_p2sh": None,
     # The script to add to the witness in (if P2WSH; None implies P2WPKH)
@@ -641,6 +666,9 @@ SIG_ADD_ZERO = {"failure": {"sign": zero_appender(default_sign)}}
 
 DUST_LIMIT = 600
 MIN_FEE = 50000
+
+TX_STANDARD_VERSIONS = [1, 2, TX_MAX_STANDARD_VERSION]
+TRUC_MAX_VSIZE = 10000 # test doesn't cover in-mempool spends, so only this limit is hit
 
 # === Actual test cases ===
 
@@ -1207,6 +1235,70 @@ def spenders_taproot_active():
                 standard = hashtype in VALID_SIGHASHES_ECDSA and (p2sh or witv0)
                 add_spender(spenders, "compat/nocsa", hashtype=hashtype, p2sh=p2sh, witv0=witv0, standard=standard, script=CScript([OP_IF, OP_11, pubkey1, OP_CHECKSIGADD, OP_12, OP_EQUAL, OP_ELSE, pubkey1, OP_CHECKSIG, OP_ENDIF]), key=eckey1, sigops_weight=4-3*witv0, inputs=[getter("sign"), b''], failure={"inputs": [getter("sign"), b'\x01']}, **ERR_BAD_OPCODE)
 
+    # == sighash caching tests ==
+
+    # Sighash caching in legacy.
+    for p2sh in [False, True]:
+        for witv0 in [False, True]:
+            eckey1, pubkey1 = generate_keypair(compressed=compressed)
+            for _ in range(10):
+                # Construct a script with 20 checksig operations (10 sighash types, each 2 times),
+                # randomly ordered and interleaved with 4 OP_CODESEPARATORS.
+                ops = [1, 2, 3, 0x21, 0x42, 0x63, 0x81, 0x83, 0xe1, 0xc2, -1, -1] * 2
+                # Make sure no OP_CODESEPARATOR appears last.
+                while True:
+                    random.shuffle(ops)
+                    if ops[-1] != -1:
+                        break
+                script = [pubkey1]
+                inputs = []
+                codeseps = -1
+                for pos, op in enumerate(ops):
+                    if op == -1:
+                        codeseps += 1
+                        script.append(OP_CODESEPARATOR)
+                    elif pos + 1 != len(ops):
+                        script += [OP_TUCK, OP_CHECKSIGVERIFY]
+                        inputs.append(getter("sign", codesepnum=codeseps, hashtype=op))
+                    else:
+                        script += [OP_CHECKSIG]
+                        inputs.append(getter("sign", codesepnum=codeseps, hashtype=op))
+                inputs.reverse()
+                script = CScript(script)
+                add_spender(spenders, "sighashcache/legacy", p2sh=p2sh, witv0=witv0, standard=False, script=script, inputs=inputs, key=eckey1, sigops_weight=12*8*(4-3*witv0), no_fail=True)
+
+    # Sighash caching in tapscript.
+    for _ in range(10):
+        # Construct a script with 700 checksig operations (7 sighash types, each 100 times),
+        # randomly ordered and interleaved with 100 OP_CODESEPARATORS.
+        ops = [0, 1, 2, 3, 0x81, 0x82, 0x83, -1] * 100
+        # Make sure no OP_CODESEPARATOR appears last.
+        while True:
+            random.shuffle(ops)
+            if ops[-1] != -1:
+                 break
+        script = [pubs[1]]
+        inputs = []
+        opcount = 1
+        codeseppos = -1
+        for pos, op in enumerate(ops):
+            if op == -1:
+                codeseppos = opcount
+                opcount += 1
+                script.append(OP_CODESEPARATOR)
+            elif pos + 1 != len(ops):
+                opcount += 2
+                script += [OP_TUCK, OP_CHECKSIGVERIFY]
+                inputs.append(getter("sign", codeseppos=codeseppos, hashtype=op))
+            else:
+                opcount += 1
+                script += [OP_CHECKSIG]
+                inputs.append(getter("sign", codeseppos=codeseppos, hashtype=op))
+        inputs.reverse()
+        script = CScript(script)
+        tap = taproot_construct(pubs[0], [("leaf", script)])
+        add_spender(spenders, "sighashcache/taproot", tap=tap, leaf="leaf", inputs=inputs, standard=True, key=secs[1], no_fail=True)
+
     return spenders
 
 
@@ -1240,8 +1332,8 @@ def sample_spenders():
     # Create a list of scripts which will be built into a taptree
     scripts = [
         # leaf label, followed by CScript
-        ("encodeable_pushdata1", CScript([OP_DROP, OP_PUSHDATA1, b'aa' * 75])),
-        ("nonstd_encodeable_pushdata1", CScript([OP_PUSHDATA1, b'aa'])),
+        ("2byte_push", CScript([OP_DROP, b'\xaa\xaa'])),
+        ("nonstd_2byte_push", CScript.fromhex("4c02aaaa")),
         ("dummyleaf", CScript([])),
     ]
 
@@ -1255,13 +1347,13 @@ def sample_spenders():
     spenders = []
 
     # Named comment, using first leaf from scripts, with empty string as witness data, no optional fail condition
-    add_spender(spenders, comment="tutorial/pushdata1", tap=tap, leaf="encodeable_pushdata1", inputs=[b'\x00'], no_fail=True)
+    add_spender(spenders, comment="tutorial/push", tap=tap, leaf="2byte_push", inputs=[b'\x00'], no_fail=True)
 
     # Spender with alternative failure tapscript via over-riding "failure" dictionary, along with the failure's expected err_msg / ERR_*
-    add_spender(spenders, comment="tutorial/pushdata1redux", tap=tap, leaf="encodeable_pushdata1", inputs=[b'\x00'], failure={"leaf": "dummyleaf"}, **ERR_EVAL_FALSE)
+    add_spender(spenders, comment="tutorial/pushredux", tap=tap, leaf="2byte_push", inputs=[b'\x00'], failure={"leaf": "dummyleaf"}, **ERR_EVAL_FALSE)
 
     # Spender that is non-standard but otherwise valid, with extraneous signature data from inner key for optional failure condition
-    add_spender(spenders, comment="tutorial/nonminpushdata1", tap=tap, leaf="nonstd_encodeable_pushdata1", key=secs[0], standard=False, failure={"inputs": [getter("sign")]}, **ERR_CLEANSTACK)
+    add_spender(spenders, comment="tutorial/nonminpush", tap=tap, leaf="nonstd_2byte_push", key=secs[0], standard=False, failure={"inputs": [getter("sign")]}, **ERR_CLEANSTACK)
 
     # New scripts=[] can be defined, and rinse-repeated as necessary until the spenders list is returned for execution
     return spenders
@@ -1337,9 +1429,9 @@ class TaprootTest(BitcoinTestFramework):
         if err_msg is not None:
             assert block_response is not None and err_msg in block_response, "Missing error message '%s' from block response '%s': %s" % (err_msg, "(None)" if block_response is None else block_response, msg)
         if accept:
-            assert node.getbestblockhash() == block.hash, "Failed to accept: %s (response: %s)" % (msg, block_response)
-            self.tip = block.sha256
-            self.lastblockhash = block.hash
+            assert node.getbestblockhash() == block.hash_hex, "Failed to accept: %s (response: %s)" % (msg, block_response)
+            self.tip = block.hash_int
+            self.lastblockhash = block.hash_hex
             self.lastblocktime += 1
             self.lastblockheight += 1
         else:
@@ -1423,9 +1515,8 @@ class TaprootTest(BitcoinTestFramework):
             # Ask the wallet to sign
             fund_tx = tx_from_hex(node.signrawtransactionwithwallet(fund_tx.serialize().hex())["hex"])
             # Construct UTXOData entries
-            fund_tx.rehash()
             for i in range(count_this_tx):
-                utxodata = UTXOData(outpoint=COutPoint(fund_tx.sha256, i), output=fund_tx.vout[i], spender=spenders[done])
+                utxodata = UTXOData(outpoint=COutPoint(fund_tx.txid_int, i), output=fund_tx.vout[i], spender=spenders[done])
                 if utxodata.spender.need_vin_vout_mismatch:
                     mismatching_utxos.append(utxodata)
                 else:
@@ -1444,7 +1535,7 @@ class TaprootTest(BitcoinTestFramework):
         while left:
             # Construct CTransaction with random version, nLocktime
             tx = CTransaction()
-            tx.version = random.choice([1, 2, random.getrandbits(32)])
+            tx.version = random.choice(TX_STANDARD_VERSIONS + [0, TX_MAX_STANDARD_VERSION + 1, random.getrandbits(32)])
             min_sequence = (tx.version != 1 and tx.version != 0) * 0x80000000  # The minimum sequence number to disable relative locktime
             if random.choice([True, False]):
                 tx.nLockTime = random.randrange(LOCKTIME_THRESHOLD, self.lastblocktime - 7200)  # all absolute locktimes in the past
@@ -1536,13 +1627,13 @@ class TaprootTest(BitcoinTestFramework):
                 is_standard_tx = (
                     fail_input is None  # Must be valid to be standard
                     and (all(utxo.spender.is_standard for utxo in input_utxos))  # All inputs must be standard
-                    and tx.version >= 1  # The tx version must be standard
-                    and tx.version <= 2)
-                tx.rehash()
+                    and tx.version in TX_STANDARD_VERSIONS # The tx version must be standard
+                    and not (tx.version == 3 and tx.get_vsize() > TRUC_MAX_VSIZE)  # Topological standardness rules must be followed
+                )
                 msg = ','.join(utxo.spender.comment + ("*" if n == fail_input else "") for n, utxo in enumerate(input_utxos))
                 if is_standard_tx:
                     node.sendrawtransaction(tx.serialize().hex(), 0)
-                    assert node.getmempoolentry(tx.hash) is not None, "Failed to accept into mempool: " + msg
+                    assert node.getmempoolentry(tx.txid_hex) is not None, "Failed to accept into mempool: " + msg
                 else:
                     assert_raises_rpc_error(-26, None, node.sendrawtransaction, tx.serialize().hex(), 0)
                 # Submit in a block
@@ -1568,11 +1659,9 @@ class TaprootTest(BitcoinTestFramework):
         coinbase.vin = [CTxIn(COutPoint(0, 0xffffffff), CScript([OP_1, OP_1]), SEQUENCE_FINAL)]
         coinbase.vout = [CTxOut(5000000000, CScript([OP_1]))]
         coinbase.nLockTime = 0
-        coinbase.rehash()
-        assert coinbase.hash == "f60c73405d499a956d3162e3483c395526ef78286458a4cb17b125aa92e49b20"
+        assert coinbase.txid_hex == "f60c73405d499a956d3162e3483c395526ef78286458a4cb17b125aa92e49b20"
         # Mine it
         block = create_block(hashprev=int(self.nodes[0].getbestblockhash(), 16), coinbase=coinbase)
-        block.rehash()
         block.solve()
         self.nodes[0].submitblock(block.serialize().hex())
         assert_equal(self.nodes[0].getblockcount(), 1)
@@ -1651,7 +1740,7 @@ class TaprootTest(BitcoinTestFramework):
         # Construct a deterministic chain of transactions creating UTXOs to the test's spk's (so that they
         # come from distinct txids).
         txn = []
-        lasttxid = coinbase.sha256
+        lasttxid = coinbase.txid_int
         amount = 5000000000
         for i, spk in enumerate(old_spks + tap_spks):
             val = 42000000 * (i + 7)
@@ -1662,11 +1751,10 @@ class TaprootTest(BitcoinTestFramework):
             if i & 1:
                 tx.vout = list(reversed(tx.vout))
             tx.nLockTime = 0
-            tx.rehash()
             amount -= val
-            lasttxid = tx.sha256
+            lasttxid = tx.txid_int
             txn.append(tx)
-            spend_info[spk]['prevout'] = COutPoint(tx.sha256, i & 1)
+            spend_info[spk]['prevout'] = COutPoint(tx.txid_int, i & 1)
             spend_info[spk]['utxo'] = CTxOut(val, spk)
         # Mine those transactions
         self.init_blockinfo(self.nodes[0])

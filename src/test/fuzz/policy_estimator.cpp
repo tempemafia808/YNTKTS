@@ -85,7 +85,7 @@ FUZZ_TARGET(policy_estimator, .init = initialize_policy_estimator)
                 block_policy_estimator.processBlock(txs, current_height);
             },
             [&] {
-                (void)block_policy_estimator.removeTx(ConsumeUInt256(fuzzed_data_provider));
+                (void)block_policy_estimator.removeTx(Txid::FromUint256(ConsumeUInt256(fuzzed_data_provider)));
             },
             [&] {
                 block_policy_estimator.FlushUnconfirmed();
@@ -111,5 +111,6 @@ FUZZ_TARGET(policy_estimator, .init = initialize_policy_estimator)
         AutoFile fuzzed_auto_file{fuzzed_file_provider.open()};
         block_policy_estimator.Write(fuzzed_auto_file);
         block_policy_estimator.Read(fuzzed_auto_file);
+        (void)fuzzed_auto_file.fclose();
     }
 }

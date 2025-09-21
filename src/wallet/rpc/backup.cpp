@@ -60,7 +60,7 @@ RPCHelpMan importprunedfunds()
     ssMB >> merkleBlock;
 
     //Search partial merkle tree in proof for our transaction and index in valid block
-    std::vector<uint256> vMatch;
+    std::vector<Txid> vMatch;
     std::vector<unsigned int> vIndex;
     if (merkleBlock.txn.ExtractMatches(vMatch, vIndex) != merkleBlock.header.hashMerkleRoot) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Something wrong with merkleblock");
@@ -72,7 +72,7 @@ RPCHelpMan importprunedfunds()
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found in chain");
     }
 
-    std::vector<uint256>::const_iterator it;
+    std::vector<Txid>::const_iterator it;
     if ((it = std::find(vMatch.begin(), vMatch.end(), tx.GetHash())) == vMatch.end()) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Transaction given doesn't exist in proof");
     }
@@ -356,11 +356,6 @@ RPCHelpMan importdescriptors()
     // the user could have gotten from another RPC command prior to now
     wallet.BlockUntilSyncedToCurrentChain();
 
-    //  Make sure wallet is a descriptor wallet
-    if (!pwallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {
-        throw JSONRPCError(RPC_WALLET_ERROR, "importdescriptors is not available for non-descriptor wallets");
-    }
-
     WalletRescanReserver reserver(*pwallet);
     if (!reserver.reserve(/*with_passphrase=*/true)) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Wallet is currently rescanning. Abort existing rescan or wait.");
@@ -399,6 +394,7 @@ RPCHelpMan importdescriptors()
             }
         }
         pwallet->ConnectScriptPubKeyManNotifiers();
+        pwallet->RefreshAllTXOs();
     }
 
     // Rescan the blockchain using the lowest timestamp
@@ -462,7 +458,7 @@ RPCHelpMan listdescriptors()
 {
     return RPCHelpMan{
         "listdescriptors",
-        "List descriptors imported into a descriptor-enabled wallet.\n",
+        "List all descriptors present in a wallet.\n",
         {
             {"private", RPCArg::Type::BOOL, RPCArg::Default{false}, "Show private descriptors."}
         },
@@ -492,10 +488,6 @@ RPCHelpMan listdescriptors()
 {
     const std::shared_ptr<const CWallet> wallet = GetWalletForJSONRPCRequest(request);
     if (!wallet) return UniValue::VNULL;
-
-    if (!wallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {
-        throw JSONRPCError(RPC_WALLET_ERROR, "listdescriptors is not available for non-descriptor wallets");
-    }
 
     const bool priv = !request.params[0].isNull() && request.params[0].get_bool();
     if (priv) {

@@ -311,7 +311,7 @@ static void entryToJSON(const CTxMemPool& pool, UniValue& info, const CTxMemPool
     std::set<std::string> setDepends;
     for (const CTxIn& txin : tx.vin)
     {
-        if (pool.exists(GenTxid::Txid(txin.prevout.hash)))
+        if (pool.exists(txin.prevout.hash))
             setDepends.insert(txin.prevout.hash.ToString());
     }
 
@@ -461,12 +461,12 @@ static RPCHelpMan getmempoolancestors()
     if (!request.params[1].isNull())
         fVerbose = request.params[1].get_bool();
 
-    uint256 hash = ParseHashV(request.params[0], "parameter 1");
+    auto txid{Txid::FromUint256(ParseHashV(request.params[0], "txid"))};
 
     const CTxMemPool& mempool = EnsureAnyMemPool(request.context);
     LOCK(mempool.cs);
 
-    const auto entry{mempool.GetEntry(Txid::FromUint256(hash))};
+    const auto entry{mempool.GetEntry(txid)};
     if (entry == nullptr) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Transaction not in mempool");
     }
@@ -483,10 +483,9 @@ static RPCHelpMan getmempoolancestors()
         UniValue o(UniValue::VOBJ);
         for (CTxMemPool::txiter ancestorIt : ancestors) {
             const CTxMemPoolEntry &e = *ancestorIt;
-            const uint256& _hash = e.GetTx().GetHash();
             UniValue info(UniValue::VOBJ);
             entryToJSON(mempool, info, e);
-            o.pushKV(_hash.ToString(), std::move(info));
+            o.pushKV(e.GetTx().GetHash().ToString(), std::move(info));
         }
         return o;
     }
@@ -523,12 +522,12 @@ static RPCHelpMan getmempooldescendants()
     if (!request.params[1].isNull())
         fVerbose = request.params[1].get_bool();
 
-    uint256 hash = ParseHashV(request.params[0], "parameter 1");
+    auto txid{Txid::FromUint256(ParseHashV(request.params[0], "txid"))};
 
     const CTxMemPool& mempool = EnsureAnyMemPool(request.context);
     LOCK(mempool.cs);
 
-    const auto it{mempool.GetIter(hash)};
+    const auto it{mempool.GetIter(txid)};
     if (!it) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Transaction not in mempool");
     }
@@ -549,10 +548,9 @@ static RPCHelpMan getmempooldescendants()
         UniValue o(UniValue::VOBJ);
         for (CTxMemPool::txiter descendantIt : setDescendants) {
             const CTxMemPoolEntry &e = *descendantIt;
-            const uint256& _hash = e.GetTx().GetHash();
             UniValue info(UniValue::VOBJ);
             entryToJSON(mempool, info, e);
-            o.pushKV(_hash.ToString(), std::move(info));
+            o.pushKV(e.GetTx().GetHash().ToString(), std::move(info));
         }
         return o;
     }
@@ -576,12 +574,12 @@ static RPCHelpMan getmempoolentry()
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
-    uint256 hash = ParseHashV(request.params[0], "parameter 1");
+    auto txid{Txid::FromUint256(ParseHashV(request.params[0], "txid"))};
 
     const CTxMemPool& mempool = EnsureAnyMemPool(request.context);
     LOCK(mempool.cs);
 
-    const auto entry{mempool.GetEntry(Txid::FromUint256(hash))};
+    const auto entry{mempool.GetEntry(txid)};
     if (entry == nullptr) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Transaction not in mempool");
     }
@@ -691,6 +689,8 @@ UniValue MempoolInfoToJSON(const CTxMemPool& pool)
     ret.pushKV("incrementalrelayfee", ValueFromAmount(pool.m_opts.incremental_relay_feerate.GetFeePerK()));
     ret.pushKV("unbroadcastcount", uint64_t{pool.GetUnbroadcastTxs().size()});
     ret.pushKV("fullrbf", true);
+    ret.pushKV("permitbaremultisig", pool.m_opts.permit_bare_multisig);
+    ret.pushKV("maxdatacarriersize", pool.m_opts.max_datacarrier_bytes.value_or(0));
     return ret;
 }
 
@@ -713,6 +713,8 @@ static RPCHelpMan getmempoolinfo()
                 {RPCResult::Type::NUM, "incrementalrelayfee", "minimum fee rate increment for mempool limiting or replacement in " + CURRENCY_UNIT + "/kvB"},
                 {RPCResult::Type::NUM, "unbroadcastcount", "Current number of transactions that haven't passed initial broadcast yet"},
                 {RPCResult::Type::BOOL, "fullrbf", "True if the mempool accepts RBF without replaceability signaling inspection (DEPRECATED)"},
+                {RPCResult::Type::BOOL, "permitbaremultisig", "True if the mempool accepts transactions with bare multisig outputs"},
+                {RPCResult::Type::NUM, "maxdatacarriersize", "Maximum number of bytes that can be used by OP_RETURN outputs in the mempool"},
             }},
         RPCExamples{
             HelpExampleCli("getmempoolinfo", "")
@@ -832,8 +834,6 @@ static std::vector<RPCResult> OrphanDescription()
         RPCResult{RPCResult::Type::NUM, "bytes", "The serialized transaction size in bytes"},
         RPCResult{RPCResult::Type::NUM, "vsize", "The virtual transaction size as defined in BIP 141. This is different from actual serialized size for witness transactions as witness data is discounted."},
         RPCResult{RPCResult::Type::NUM, "weight", "The transaction weight as defined in BIP 141."},
-        RPCResult{RPCResult::Type::NUM_TIME, "entry", "The entry time into the orphanage expressed in " + UNIX_EPOCH_TIME},
-        RPCResult{RPCResult::Type::NUM_TIME, "expiration", "The orphan expiration time expressed in " + UNIX_EPOCH_TIME},
         RPCResult{RPCResult::Type::ARR, "from", "",
         {
             RPCResult{RPCResult::Type::NUM, "peer_id", "Peer ID"},
@@ -841,7 +841,7 @@ static std::vector<RPCResult> OrphanDescription()
     };
 }
 
-static UniValue OrphanToJSON(const TxOrphanage::OrphanTxBase& orphan)
+static UniValue OrphanToJSON(const node::TxOrphanage::OrphanInfo& orphan)
 {
     UniValue o(UniValue::VOBJ);
     o.pushKV("txid", orphan.tx->GetHash().ToString());
@@ -849,8 +849,6 @@ static UniValue OrphanToJSON(const TxOrphanage::OrphanTxBase& orphan)
     o.pushKV("bytes", orphan.tx->GetTotalSize());
     o.pushKV("vsize", GetVirtualTransactionSize(*orphan.tx));
     o.pushKV("weight", GetTransactionWeight(*orphan.tx));
-    o.pushKV("entry", int64_t{TicksSinceEpoch<std::chrono::seconds>(orphan.nTimeExpire - ORPHAN_TX_EXPIRE_TIME)});
-    o.pushKV("expiration", int64_t{TicksSinceEpoch<std::chrono::seconds>(orphan.nTimeExpire)});
     UniValue from(UniValue::VARR);
     for (const auto fromPeer: orphan.announcers) {
         from.push_back(fromPeer);
@@ -899,7 +897,7 @@ static RPCHelpMan getorphantxs()
         {
             const NodeContext& node = EnsureAnyNodeContext(request.context);
             PeerManager& peerman = EnsurePeerman(node);
-            std::vector<TxOrphanage::OrphanTxBase> orphanage = peerman.GetOrphanTransactions();
+            std::vector<node::TxOrphanage::OrphanInfo> orphanage = peerman.GetOrphanTransactions();
 
             int verbosity{ParseVerbosity(request.params[0], /*default_verbosity=*/0, /*allow_bool*/false)};
 
@@ -1038,7 +1036,7 @@ static RPCHelpMan submitpackage()
                     // Belt-and-suspenders check; everything should be successful here
                     CHECK_NONFATAL(package_result.m_tx_results.size() == txns.size());
                     for (const auto& tx : txns) {
-                        CHECK_NONFATAL(mempool.exists(GenTxid::Txid(tx->GetHash())));
+                        CHECK_NONFATAL(mempool.exists(tx->GetHash()));
                     }
                     break;
                 }
@@ -1062,7 +1060,7 @@ static RPCHelpMan submitpackage()
             size_t num_broadcast{0};
             for (const auto& tx : txns) {
                 // We don't want to re-submit the txn for validation in BroadcastTransaction
-                if (!mempool.exists(GenTxid::Txid(tx->GetHash()))) {
+                if (!mempool.exists(tx->GetHash())) {
                     continue;
                 }
 
@@ -1080,7 +1078,7 @@ static RPCHelpMan submitpackage()
             UniValue rpc_result{UniValue::VOBJ};
             rpc_result.pushKV("package_msg", package_msg);
             UniValue tx_result_map{UniValue::VOBJ};
-            std::set<uint256> replaced_txids;
+            std::set<Txid> replaced_txids;
             for (const auto& tx : txns) {
                 UniValue result_inner{UniValue::VOBJ};
                 result_inner.pushKV("txid", tx->GetHash().GetHex());
@@ -1124,7 +1122,7 @@ static RPCHelpMan submitpackage()
             }
             rpc_result.pushKV("tx-results", std::move(tx_result_map));
             UniValue replaced_list(UniValue::VARR);
-            for (const uint256& hash : replaced_txids) replaced_list.push_back(hash.ToString());
+            for (const auto& txid : replaced_txids) replaced_list.push_back(txid.ToString());
             rpc_result.pushKV("replaced-transactions", std::move(replaced_list));
             return rpc_result;
         },

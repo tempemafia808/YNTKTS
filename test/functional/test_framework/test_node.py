@@ -11,6 +11,7 @@ from enum import Enum
 import json
 import logging
 import os
+import pathlib
 import platform
 import re
 import subprocess
@@ -19,6 +20,7 @@ import time
 import urllib.parse
 import collections
 import shlex
+import shutil
 import sys
 from pathlib import Path
 
@@ -46,9 +48,23 @@ BITCOIND_PROC_WAIT_TIMEOUT = 60
 # The size of the blocks xor key
 # from InitBlocksdirXorKey::xor_key.size()
 NUM_XOR_BYTES = 8
+# Many systems have a 128kB limit for a command size. Depending on the
+# platform, this limit may be larger or smaller. Moreover, when using the
+# 'bitcoin' command, it may internally insert more args, which must be
+# accounted for. There is no need to pick the largest possible value here
+# anyway and it should be fine to set it to 1kB in tests.
+TEST_CLI_MAX_ARG_SIZE = 1024
+
 # The null blocks key (all 0s)
 NULL_BLK_XOR_KEY = bytes([0] * NUM_XOR_BYTES)
 BITCOIN_PID_FILENAME_DEFAULT = "bitcoind.pid"
+
+if sys.platform.startswith("linux"):
+    UNIX_PATH_MAX = 108          # includes the trailing NUL
+elif sys.platform.startswith(("darwin", "freebsd", "netbsd", "openbsd")):
+    UNIX_PATH_MAX = 104
+else:                            # safest portable value
+    UNIX_PATH_MAX = 92
 
 
 class FailedToStartError(Exception):
@@ -75,7 +91,7 @@ class TestNode():
     To make things easier for the test writer, any unrecognised messages will
     be dispatched to the RPC connection."""
 
-    def __init__(self, i, datadir_path, *, chain, rpchost, timewait, timeout_factor, binaries, coverage_dir, cwd, extra_conf=None, extra_args=None, use_cli=False, start_perf=False, use_valgrind=False, version=None, v2transport=False, uses_wallet=False):
+    def __init__(self, i, datadir_path, *, chain, rpchost, timewait, timeout_factor, binaries, coverage_dir, cwd, extra_conf=None, extra_args=None, use_cli=False, start_perf=False, use_valgrind=False, version=None, v2transport=False, uses_wallet=False, ipcbind=False):
         """
         Kwargs:
             start_perf (bool): If True, begin profiling the node with `perf` as soon as
@@ -107,7 +123,7 @@ class TestNode():
         # Configuration for logging is set as command-line args rather than in the bitcoin.conf file.
         # This means that starting a bitcoind using the temp dir to debug a failed test won't
         # spam debug.log.
-        self.args = self.binaries.daemon_argv() + [
+        self.args = self.binaries.node_argv(need_ipc=ipcbind) + [
             f"-datadir={self.datadir_path}",
             "-logtimemicros",
             "-debug",
@@ -118,6 +134,17 @@ class TestNode():
         ]
         if uses_wallet is not None and not uses_wallet:
             self.args.append("-disablewallet")
+
+        self.ipc_tmp_dir = None
+        if ipcbind:
+            self.ipc_socket_path = self.chain_path / "node.sock"
+            if len(os.fsencode(self.ipc_socket_path)) < UNIX_PATH_MAX:
+                self.args.append("-ipcbind=unix")
+            else:
+                # Work around default CI path exceeding maximum socket path length.
+                self.ipc_tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="test-ipc-"))
+                self.ipc_socket_path = self.ipc_tmp_dir / "node.sock"
+                self.args.append(f"-ipcbind=unix:{self.ipc_socket_path}")
 
         # Use valgrind, expect for previous release binaries
         if use_valgrind and version is None:
@@ -134,6 +161,8 @@ class TestNode():
             self.args.append("-logsourcelocations")
         if self.version_is_at_least(239000):
             self.args.append("-loglevel=trace")
+        if self.version_is_at_least(299900):
+            self.args.append("-nologratelimit")
 
         # Default behavior from global -v2transport flag is added to args to persist it over restarts.
         # May be overwritten in individual tests, using extra_args.
@@ -153,7 +182,8 @@ class TestNode():
         self.running = False
         self.process = None
         self.rpc_connected = False
-        self.rpc = None
+        self._rpc = None # Should usually not be accessed directly in tests to allow for --usecli mode
+        self.reuse_http_connections = True # Must be set before calling get_rpc_proxy() i.e. before restarting node
         self.url = None
         self.log = logging.getLogger('TestFramework.node%d' % i)
         # Cache perf subprocesses here by their data output filename.
@@ -203,14 +233,17 @@ class TestNode():
             # this destructor is called.
             print(self._node_msg("Cleaning up leftover process"), file=sys.stderr)
             self.process.kill()
+        if self.ipc_tmp_dir:
+            print(self._node_msg(f"Cleaning up ipc directory {str(self.ipc_tmp_dir)!r}"))
+            shutil.rmtree(self.ipc_tmp_dir)
 
     def __getattr__(self, name):
         """Dispatches any unrecognised messages to the RPC connection or a CLI instance."""
         if self.use_cli:
             return getattr(self.cli, name)
         else:
-            assert self.rpc_connected and self.rpc is not None, self._node_msg("Error: no RPC connection")
-            return getattr(self.rpc, name)
+            assert self.rpc_connected and self._rpc is not None, self._node_msg("Error: no RPC connection")
+            return getattr(self._rpc, name)
 
     def start(self, extra_args=None, *, cwd=None, stdout=None, stderr=None, env=None, **kwargs):
         """Start the node."""
@@ -262,8 +295,13 @@ class TestNode():
         """Sets up an RPC connection to the bitcoind process. Returns False if unable to connect."""
         # Poll at a rate of four times per second
         poll_per_s = 4
+
         suppressed_errors = collections.defaultdict(int)
-        latest_error = ""
+        latest_error = None
+        def suppress_error(category: str, e: Exception):
+            suppressed_errors[category] += 1
+            return (category, repr(e))
+
         for _ in range(poll_per_s * self.rpc_timeout):
             if self.process.poll() is not None:
                 # Attach abrupt shutdown error/s to the exception message
@@ -280,6 +318,7 @@ class TestNode():
                     timeout=self.rpc_timeout // 2,  # Shorter timeout to allow for one retry in case of ETIMEDOUT
                     coveragedir=self.coverage_dir,
                 )
+                rpc.auth_service_proxy_instance.reuse_http_connections = self.reuse_http_connections
                 rpc.getblockcount()
                 # If the call to getblockcount() succeeds then the RPC connection is up
                 if self.version_is_at_least(190000) and wait_for_import:
@@ -308,8 +347,8 @@ class TestNode():
                 self.rpc_connected = True
                 if self.use_cli:
                     return
-                self.rpc = rpc
-                self.url = self.rpc.rpc_url
+                self._rpc = rpc
+                self.url = self._rpc.rpc_url
                 return
             except JSONRPCException as e:
                 # Suppress these as they are expected during initialization.
@@ -317,8 +356,7 @@ class TestNode():
                 # -342 Service unavailable, could be starting up or shutting down
                 if e.error['code'] not in [-28, -342]:
                     raise  # unknown JSON RPC exception
-                suppressed_errors[f"JSONRPCException {e.error['code']}"] += 1
-                latest_error = repr(e)
+                latest_error = suppress_error(f"JSONRPCException {e.error['code']}", e)
             except OSError as e:
                 error_num = e.errno
                 # Work around issue where socket timeouts don't have errno set.
@@ -334,16 +372,14 @@ class TestNode():
                     errno.ECONNREFUSED  # Port not yet open?
                 ]:
                     raise  # unknown OS error
-                suppressed_errors[f"OSError {errno.errorcode[error_num]}"] += 1
-                latest_error = repr(e)
+                latest_error = suppress_error(f"OSError {errno.errorcode[error_num]}", e)
             except ValueError as e:
                 # Suppress if cookie file isn't generated yet and no rpcuser or rpcpassword; bitcoind may be starting.
                 if "No RPC credentials" not in str(e):
                     raise
-                suppressed_errors["missing_credentials"] += 1
-                latest_error = repr(e)
+                latest_error = suppress_error("missing_credentials", e)
             time.sleep(1.0 / poll_per_s)
-        self._raise_assertion_error(f"Unable to connect to bitcoind after {self.rpc_timeout}s (ignored errors: {str(dict(suppressed_errors))}, latest error: {latest_error})")
+        self._raise_assertion_error(f"Unable to connect to bitcoind after {self.rpc_timeout}s (ignored errors: {dict(suppressed_errors)!s}{'' if latest_error is None else f', latest: {latest_error[0]!r}/{latest_error[1]}'})")
 
     def wait_for_cookie_credentials(self):
         """Ensures auth cookie credentials can be read, e.g. for testing CLI with -rpcwait before RPC connection is up."""
@@ -389,9 +425,9 @@ class TestNode():
         if self.use_cli:
             return self.cli("-rpcwallet={}".format(wallet_name))
         else:
-            assert self.rpc_connected and self.rpc, self._node_msg("RPC not connected")
+            assert self.rpc_connected and self._rpc, self._node_msg("RPC not connected")
             wallet_path = "wallet/{}".format(urllib.parse.quote(wallet_name))
-            return self.rpc / wallet_path
+            return self._rpc / wallet_path
 
     def version_is_at_least(self, ver):
         return self.version is None or self.version >= ver
@@ -446,7 +482,7 @@ class TestNode():
         self.running = False
         self.process = None
         self.rpc_connected = False
-        self.rpc = None
+        self._rpc = None
         self.log.debug("Node stopped")
         return True
 
@@ -875,7 +911,7 @@ def arg_to_cli(arg):
         return str(arg).lower()
     elif arg is None:
         return 'null'
-    elif isinstance(arg, dict) or isinstance(arg, list):
+    elif isinstance(arg, dict) or isinstance(arg, list) or isinstance(arg, tuple):
         return json.dumps(arg, default=serialization_fallback)
     else:
         return str(arg)
@@ -912,16 +948,32 @@ class TestNodeCLI():
     def send_cli(self, clicommand=None, *args, **kwargs):
         """Run bitcoin-cli command. Deserializes returned string as python object."""
         pos_args = [arg_to_cli(arg) for arg in args]
-        named_args = [str(key) + "=" + arg_to_cli(value) for (key, value) in kwargs.items()]
+        named_args = [key + "=" + arg_to_cli(value) for (key, value) in kwargs.items() if value is not None]
         p_args = self.binaries.rpc_argv() + [f"-datadir={self.datadir}"] + self.options
         if named_args:
             p_args += ["-named"]
+        base_arg_pos = len(p_args)
         if clicommand is not None:
             p_args += [clicommand]
         p_args += pos_args + named_args
+
+        # TEST_CLI_MAX_ARG_SIZE is set low enough that checking the string
+        # length is enough and encoding to bytes is not needed before
+        # calculating the sum.
+        sum_arg_size = sum(len(arg) for arg in p_args)
+        stdin_data = self.input
+        if sum_arg_size >= TEST_CLI_MAX_ARG_SIZE:
+            self.log.debug(f"Cli: Command size {sum_arg_size} too large, using stdin")
+            rpc_args = "\n".join([arg for arg in p_args[base_arg_pos:]])
+            if stdin_data is not None:
+                stdin_data += "\n" + rpc_args
+            else:
+                stdin_data = rpc_args
+            p_args = p_args[:base_arg_pos] + ['-stdin']
+
         self.log.debug("Running bitcoin-cli {}".format(p_args[2:]))
         process = subprocess.Popen(p_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        cli_stdout, cli_stderr = process.communicate(input=self.input)
+        cli_stdout, cli_stderr = process.communicate(input=stdin_data)
         returncode = process.poll()
         if returncode:
             match = re.match(r'error code: ([-0-9]+)\nerror message:\n(.*)', cli_stderr)
